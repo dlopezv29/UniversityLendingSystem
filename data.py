@@ -15,13 +15,28 @@ from datetime import date
 # ---------------------------------------------------------------------------
 USERS: dict[str, dict] = {
     "admin": {"password": "password", "role": "admin"},
-    "staff": {"password": "staff", "role": "staff"},
+    "DGarcia": {"password": "password", "role": "professor", "professor": "Prof. García"},
 }
 SESSIONS: dict[str, str] = {}  # token -> username
 
 
 def new_token() -> str:
     return secrets.token_hex(16)
+
+
+# Words used to build human-readable return codes (e.g. "BRAVO-TANGO-4821").
+_CODE_WORDS = [
+    "BRAVO", "TANGO", "DELTA", "ZULU", "ECHO", "OMEGA",
+    "SIERRA", "KILO", "LIMA", "NOVA", "ORION", "VEGA",
+]
+
+
+def generate_return_code() -> str:
+    """A fresh random return code: two words plus a 4-digit number."""
+    w1 = secrets.choice(_CODE_WORDS)
+    w2 = secrets.choice(_CODE_WORDS)
+    n = secrets.randbelow(10000)
+    return f"{w1}-{w2}-{n:04d}"
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +78,9 @@ ITEMS: list[dict] = [
 ]
 
 PROFESSORS: list[dict] = [
-    {"id": 1, "name": "Prof. García", "department": "Engineering"},
-    {"id": 2, "name": "Prof. Rodríguez", "department": "Business"},
-    {"id": 3, "name": "Prof. Jiménez", "department": "Arts & Sciences"},
+    {"id": 1, "id_card": "PROF-001", "name": "Prof. García", "department": "Engineering"},
+    {"id": 2, "id_card": "PROF-002", "name": "Prof. Rodríguez", "department": "Business"},
+    {"id": 3, "id_card": "PROF-003", "name": "Prof. Jiménez", "department": "Arts & Sciences"},
 ]
 NEXT_PROF_ID = 4
 
@@ -92,6 +107,19 @@ def find_professor(prof_id: int):
     return None
 
 
+def find_professor_by_id_card(id_card: str):
+    """Return the professor dict with the given ID Card, or None."""
+    for prof in PROFESSORS:
+        if prof["id_card"] == id_card:
+            return prof
+    return None
+
+
+def valid_id_card(id_card: str) -> bool:
+    """Same rule as item IDs: letters, numbers, dashes, underscores; non-empty."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", id_card))
+
+
 def is_overdue(item: dict) -> bool:
     return bool(
         item["status"] == "assigned"
@@ -116,10 +144,10 @@ def add_item(item_id: str, name: str, category: str, description: str) -> dict:
     return item
 
 
-def add_professor(name: str, department: str) -> dict:
+def add_professor(name: str, department: str, id_card: str) -> dict:
     """Append a new professor, owning the auto-increment id counter."""
     global NEXT_PROF_ID
-    prof = {"id": NEXT_PROF_ID, "name": name, "department": department}
+    prof = {"id": NEXT_PROF_ID, "id_card": id_card, "name": name, "department": department}
     PROFESSORS.append(prof)
     NEXT_PROF_ID += 1
     return prof

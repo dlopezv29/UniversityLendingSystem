@@ -7,7 +7,9 @@ always visible).
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 from datetime import date
 
 import data
@@ -120,6 +122,10 @@ def render_layout(
   .filters {{ display:flex; gap:14px; flex-wrap:wrap; margin:0 0 16px; }}
   .filters > div {{ min-width:170px; }}
   .filters select {{ width:auto; min-width:170px; }}
+  .filter-check {{ display:flex; align-items:flex-end; min-width:0; }}
+  .filter-check label {{ display:flex; align-items:center; gap:7px; font-size:13px;
+            font-weight:500; cursor:pointer; padding-bottom:9px; white-space:nowrap; }}
+  .filter-check input {{ width:auto; margin:0; }}
   form.inline {{ display:inline; }}
   input,select,textarea {{ font:inherit; font-size:14px; padding:9px 11px;
            border:1px solid #cbd5e1; border-radius:var(--radius); width:100%;
@@ -197,6 +203,11 @@ def render_layout(
   .prof-metric b {{ font-size:22px; font-weight:700; font-variant-numeric:tabular-nums;
             color:var(--fg); }}
   .prof-metric span {{ font-size:12px; color:var(--muted); }}
+  .prof-metric-btn {{ width:100%; border:1px solid var(--line); cursor:pointer;
+            text-align:left; transition:border-color .12s, background .12s; }}
+  .prof-metric-btn:hover {{ border-color:var(--accent); background:var(--accent-soft); }}
+  .prof-items {{ margin-top:-6px; overflow-x:auto; }}
+  .prof-items table {{ font-size:12px; }}
   .prof-card .actions {{ margin-top:auto; }}
   .empty {{ text-align:center; padding:44px 20px; color:var(--muted); }}
   /* Edit modal */
@@ -210,6 +221,16 @@ def render_layout(
   @media (prefers-reduced-motion: reduce) {{
     * {{ animation:none !important; transition:none !important; }}
   }}
+  /* Return receipt */
+  .receipt {{ text-align:center; max-width:420px; margin:0 auto; }}
+  .qr-box {{ display:inline-block; padding:14px; background:#fff;
+            border:1px solid var(--line); border-radius:12px; margin:4px 0 18px; }}
+  .qr-box svg {{ display:block; width:180px; height:180px; }}
+  .return-code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+            font-size:26px; font-weight:700; letter-spacing:.06em; color:var(--fg);
+            background:var(--bg); border:1px dashed var(--line); border-radius:10px;
+            padding:12px 16px; margin:0 0 10px; }}
+  .receipt .actions {{ justify-content:center; }}
 </style>
 </head>
 <body>
@@ -241,10 +262,13 @@ def render_index(
     request_values: dict | None = None,
     add_error: str | None = None,
     add_values: dict | None = None,
+    return_error: str | None = None,
+    return_error_id: str | None = None,
 ) -> str:
     """Item Management page: items table + filters + (admin-only) add form and
     New Request modal. Professors now live on their own page."""
     is_admin = user["role"] == "admin"
+    professor_name = user.get("professor", "")
 
     visible_items = data.ITEMS
     if category_filter:
@@ -265,6 +289,12 @@ def render_index(
         f'{html.escape(c)}</option>'
         for c in data.CATEGORIES
     )
+    assigned_to_me_filter = "" if is_admin else f"""
+  <div class="filter-check">
+    <label><input type="checkbox" id="assignedToMe" onchange="applyRowFilters()"
+      {' checked' if professor_name else ''}> Assigned to me</label>
+  </div>
+"""
     filters = f"""
 <form class="filters" method="get" action="/">
   <div>
@@ -281,6 +311,13 @@ def render_index(
       <option value="1"{' selected' if overdue_only else ''}>Overdue only</option>
     </select>
   </div>
+  <div>
+    <label>Item Name</label>
+    <input type="search" id="nameFilter" placeholder="Type to filter…"
+           oninput="applyRowFilters()"
+           onkeydown="if(event.key==='Enter')event.preventDefault()">
+  </div>
+  {assigned_to_me_filter}
 </form>
 """
 
@@ -288,6 +325,7 @@ def render_index(
     add_form = ""
     edit_modal = ""
     request_modal = ""
+    return_modal = ""
     if is_admin:
         toolbar = """
     <div class="toolbar">
@@ -407,6 +445,29 @@ def render_index(
   </div>
 </div>
 """
+    else:
+        return_err_html = f'<div class="error">{html.escape(return_error)}</div>' if return_error else ""
+        return_open_cls = " open" if return_error else ""
+        return_id_val = html.escape(return_error_id or "", quote=True)
+        return_modal = f"""
+<div class="modal{return_open_cls}" id="returnModal" onclick="if(event.target===this)closeReturn()">
+  <div class="card">
+    <h2>Return item</h2>
+    {return_err_html}
+    <form action="/return" method="post">
+      <input type="hidden" name="id" id="return-id" value="{return_id_val}">
+      <div style="margin-bottom:16px">
+        <label>Return code *</label>
+        <input name="code" required autofocus placeholder="Enter the code given by the admin">
+      </div>
+      <div class="actions">
+        <button class="btn-primary" type="submit">Confirm return</button>
+        <button class="btn-ghost" type="button" onclick="closeReturn()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+"""
 
     table = f"""
 <div class="card">
@@ -419,9 +480,33 @@ def render_index(
     <thead>
       <tr><th>Item</th><th>Category</th><th>Status</th><th>Assigned to</th><th style="text-align:right">Actions</th></tr>
     </thead>
-    <tbody>{rows}</tbody>
+    <tbody>{rows}
+      <tr id="noMatch" style="display:none"><td colspan="5" class="muted">No items match.</td></tr>
+    </tbody>
   </table>
 </div>
+"""
+    filter_script = f"""
+<script>
+  var MY_NAME = {json.dumps(professor_name)};
+  function applyRowFilters() {{
+    var q = (document.getElementById('nameFilter').value || '').toLowerCase();
+    var assignedCb = document.getElementById('assignedToMe');
+    var mine = assignedCb ? assignedCb.checked : false;
+    var rows = document.querySelectorAll('table tbody tr[data-name]');
+    var shown = 0;
+    rows.forEach(function (tr) {{
+      var okName = tr.dataset.name.indexOf(q) !== -1;
+      var okMine = !mine || tr.dataset.assigned === MY_NAME;
+      var show = okName && okMine;
+      tr.style.display = show ? '' : 'none';
+      if (show) shown++;
+    }});
+    var nm = document.getElementById('noMatch');
+    if (nm) nm.style.display = shown === 0 ? '' : 'none';
+  }}
+  document.addEventListener('DOMContentLoaded', applyRowFilters);
+</script>
 """
     scripts = """
 <script>
@@ -455,7 +540,24 @@ def render_index(
   });
 </script>
 """
-    body = table + add_form + edit_modal + request_modal + (scripts if is_admin else "")
+    return_scripts = "" if is_admin else """
+<script>
+  function openReturn(btn) {
+    document.getElementById('return-id').value = btn.dataset.id;
+    document.getElementById('returnModal').classList.add('open');
+  }
+  function closeReturn() {
+    document.getElementById('returnModal').classList.remove('open');
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { closeReturn(); }
+  });
+</script>
+"""
+    body = (
+        table + add_form + edit_modal + request_modal + return_modal
+        + filter_script + (scripts if is_admin else return_scripts)
+    )
     return render_layout("Item Management", body, user, active_nav="items")
 
 
@@ -470,34 +572,78 @@ def _initials(name: str) -> str:
     return (words[0][0] + words[-1][0]).upper()
 
 
-def render_professors_page(user: dict, professors_error: str | None = None) -> str:
+def render_professors_page(
+    user: dict,
+    professors_error: str | None = None,
+    add_error: str | None = None,
+    add_values: dict | None = None,
+) -> str:
     """Professors Management page — a card-grid view, visually distinct from the
     items table. Admin-only; each card shows the professor plus their active
     item count, with edit/remove controls."""
     total = len(data.PROFESSORS)
     assigned_total = sum(1 for i in data.ITEMS if i["status"] == "assigned")
 
+    av = add_values or {}
+    add_idcard_val = html.escape(av.get("id_card", ""), quote=True)
+    add_name_val = html.escape(av.get("name", ""), quote=True)
+    add_dept_val = html.escape(av.get("department", ""), quote=True)
+    add_err_html = f'<div class="error">{html.escape(add_error)}</div>' if add_error else ""
+    add_open_cls = " open" if add_error else ""
+
     cards = ""
     for p in data.PROFESSORS:
-        count = sum(
-            1 for i in data.ITEMS if i["assigned_to"] == p["name"] and i["status"] == "assigned"
-        )
+        active = [
+            i for i in data.ITEMS if i["assigned_to"] == p["name"] and i["status"] == "assigned"
+        ]
+        count = len(active)
         dept = html.escape(p["department"]) if p["department"] else '<span class="muted">No department</span>'
+
+        if count > 0:
+            rows = "".join(
+                f"""
+        <tr>
+          <td>{html.escape(i['name'])}</td>
+          <td>{html.escape(i['assigned_on']) or '—'}</td>
+          <td>{html.escape(i['due_date']) or '—'}{' <span class="badge-overdue">Overdue</span>' if data.is_overdue(i) else ''}</td>
+          <td>
+            <form class="inline" action="/return" method="post">
+              <input type="hidden" name="id" value="{html.escape(str(i['id']), quote=True)}">
+              <button class="btn-ghost btn-sm" type="submit">Return</button>
+            </form>
+          </td>
+        </tr>"""
+                for i in active
+            )
+            metric = f"""
+      <button type="button" class="prof-metric prof-metric-btn"
+              onclick="toggleProfItems({p['id']})">
+        <b>{count}</b><span>active item{'' if count == 1 else 's'}</span>
+      </button>
+      <div class="collapse prof-items" id="profItems{p['id']}">
+        <table>
+          <thead><tr><th>Item</th><th>Since</th><th>Due</th><th></th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>"""
+        else:
+            metric = """
+      <div class="prof-metric"><b>0</b><span>active items</span></div>"""
+
         cards += f"""
     <div class="prof-card">
       <div class="top">
         <div class="avatar" aria-hidden="true">{html.escape(_initials(p['name']))}</div>
         <div>
           <div class="name">{html.escape(p['name'])}</div>
+          <div class="idcard muted">ID Card: {html.escape(p['id_card'])}</div>
           <div class="dept">{dept}</div>
         </div>
-      </div>
-      <div class="prof-metric">
-        <b>{count}</b><span>active item{'' if count == 1 else 's'}</span>
-      </div>
+      </div>{metric}
       <div class="actions">
         <button class="btn-ghost btn-sm" type="button"
-                data-id="{p['id']}" data-name="{html.escape(p['name'], quote=True)}"
+                data-id="{p['id']}" data-idcard="{html.escape(p['id_card'], quote=True)}"
+                data-name="{html.escape(p['name'], quote=True)}"
                 data-department="{html.escape(p['department'], quote=True)}"
                 onclick="openProfEdit(this)">Edit</button>
         <form class="inline" action="/professors/remove" method="post"
@@ -525,12 +671,14 @@ def render_professors_page(user: dict, professors_error: str | None = None) -> s
   <button class="btn-accent" type="button" onclick="toggleAddProf(this)" id="addProfToggle">+ Add professor</button>
 </div>
 
-<div class="card collapse" id="addProfForm">
+<div class="card collapse{add_open_cls}" id="addProfForm">
   <h2 style="margin-bottom:16px">New professor</h2>
+  {add_err_html}
   <form action="/professors/add" method="post">
     <div class="grid">
-      <div><label>Name *</label><input name="name" required placeholder="e.g. Prof. Smith"></div>
-      <div><label>Department</label><input name="department" placeholder="e.g. Engineering"></div>
+      <div><label>ID Card *</label><input name="id_card" required placeholder="e.g. PROF-004" value="{add_idcard_val}"></div>
+      <div><label>Name *</label><input name="name" required placeholder="e.g. Prof. Smith" value="{add_name_val}"></div>
+      <div><label>Department</label><input name="department" placeholder="e.g. Engineering" value="{add_dept_val}"></div>
     </div>
     <div class="actions">
       <button class="btn-primary" type="submit">Add professor</button>
@@ -547,6 +695,7 @@ def render_professors_page(user: dict, professors_error: str | None = None) -> s
     <form action="/professors/edit" method="post" onsubmit="return confirm('Save changes?');">
       <input type="hidden" name="id" id="profedit-id">
       <div class="grid">
+        <div><label>ID Card *</label><input name="id_card" id="profedit-idcard" required></div>
         <div><label>Name *</label><input name="name" id="profedit-name" required></div>
         <div><label>Department</label><input name="department" id="profedit-department"></div>
       </div>
@@ -567,9 +716,13 @@ def render_professors_page(user: dict, professors_error: str | None = None) -> s
   }}
   function openProfEdit(btn) {{
     document.getElementById('profedit-id').value = btn.dataset.id;
+    document.getElementById('profedit-idcard').value = btn.dataset.idcard;
     document.getElementById('profedit-name').value = btn.dataset.name;
     document.getElementById('profedit-department').value = btn.dataset.department;
     document.getElementById('profEditModal').classList.add('open');
+  }}
+  function toggleProfItems(id) {{
+    document.getElementById('profItems' + id).classList.toggle('open');
   }}
   function closeProfEdit() {{
     document.getElementById('profEditModal').classList.remove('open');
@@ -622,6 +775,71 @@ def render_confirm_request(
     return render_layout("Confirm request", body, user, active_nav="items")
 
 
+def _qr_placeholder_svg(code: str) -> str:
+    """A decorative, non-functional QR-looking SVG derived from ``code``.
+
+    Fills a 21x21 module grid pseudo-randomly from a hash of the code (so each
+    code looks distinct) and stamps the three corner finder patterns. Pure
+    string building — no image libraries, matching the app's inline-SVG style.
+    """
+    n = 21
+    # Expand the digest to at least one bit per module.
+    digest = hashlib.md5(code.encode()).digest()
+    bits = (digest * ((n * n) // len(digest) // 8 + 1))
+
+    def is_finder(r: int, c: int) -> bool:
+        # 7x7 finder regions at three corners.
+        return (
+            (r < 7 and c < 7)
+            or (r < 7 and c >= n - 7)
+            or (r >= n - 7 and c < 7)
+        )
+
+    def finder_on(r: int, c: int) -> bool:
+        # Map to local finder coords: filled ring + center 3x3 block.
+        lr = r if r < 7 else r - (n - 7)
+        lc = c if c < 7 else c - (n - 7)
+        if lr in (0, 6) or lc in (0, 6):
+            return True
+        return 2 <= lr <= 4 and 2 <= lc <= 4
+
+    cells = []
+    for r in range(n):
+        for c in range(n):
+            if is_finder(r, c):
+                on = finder_on(r, c)
+            else:
+                idx = r * n + c
+                on = bool(bits[idx // 8] & (1 << (idx % 8)))
+            if on:
+                cells.append(f'<rect x="{c}" y="{r}" width="1" height="1"/>')
+    return (
+        f'<svg viewBox="0 0 {n} {n}" xmlns="http://www.w3.org/2000/svg" '
+        f'shape-rendering="crispEdges" role="img" aria-label="QR code placeholder">'
+        f'<rect width="{n}" height="{n}" fill="#fff"/>'
+        f'<g fill="#0f172a">{"".join(cells)}</g></svg>'
+    )
+
+
+def render_return_result(item: dict, code: str, user: dict) -> str:
+    """Receipt shown after an item is returned: QR placeholder + pickup code."""
+    body = f"""
+<div class="card receipt">
+  <h2>Item returned</h2>
+  <div class="qr-box">{_qr_placeholder_svg(code)}</div>
+  <div class="return-code">{html.escape(code)}</div>
+  <p class="muted"><strong>{html.escape(item['name'])}</strong> is now available again.</p>
+  <div class="actions">
+    <a class="btn-primary" href="/"
+       style="display:inline-flex;align-items:center;padding:9px 15px;text-decoration:none">Back to Items</a>
+    <a class="btn-ghost btn-sm" href="/professors"
+       style="display:inline-flex;align-items:center;padding:9px 15px;text-decoration:none">Professors</a>
+  </div>
+</div>
+"""
+    return render_layout("Return receipt", body, user, active_nav="items")
+
+
 def render_row(item: dict, user: dict) -> str:
     """One table row for an item."""
     is_admin = user["role"] == "admin"
@@ -636,11 +854,16 @@ def render_row(item: dict, user: dict) -> str:
             f'<div class="muted">since {html.escape(item["assigned_on"])} '
             f'· due {html.escape(item["due_date"])}</div>'
         )
-        assign_control = f"""
+        if is_admin:
+            assign_control = f"""
         <form class="inline" action="/return" method="post">
           <input type="hidden" name="id" value="{item_id}">
           <button class="btn-ghost btn-sm" type="submit">Return</button>
         </form>"""
+        else:
+            assign_control = f"""
+        <button class="btn-ghost btn-sm" type="button" data-id="{item_id}"
+                onclick="openReturn(this)">Return</button>"""
     else:
         assigned = '<span class="muted">—</span>'
         assign_control = ""
@@ -677,7 +900,7 @@ def render_row(item: dict, user: dict) -> str:
         admin_actions = ""
 
     return f"""
-<tr>
+<tr data-name="{html.escape(item['name'].lower(), quote=True)}" data-assigned="{html.escape(item['assigned_to'], quote=True)}">
   <td><strong>{html.escape(item['name'])}</strong>{desc}</td>
   <td>{html.escape(item['category']) or '<span class="muted">—</span>'}</td>
   <td>{badge}</td>
@@ -701,7 +924,7 @@ def render_login(error: bool = False) -> str:
     {err}
     <form action="/login" method="post">
       <div class="field"><label>Username</label>
-        <input name="username" required autofocus autocomplete="username" placeholder="admin or staff"></div>
+        <input name="username" required autofocus autocomplete="username" placeholder="admin or DGarcia"></div>
       <div class="field"><label>Password</label>
         <input name="password" type="password" required autocomplete="current-password"></div>
       <button class="btn-primary" type="submit" style="width:100%">Sign in</button>

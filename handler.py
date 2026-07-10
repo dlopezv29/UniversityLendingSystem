@@ -50,7 +50,12 @@ class Handler(BaseHTTPRequestHandler):
             return None
         username = data.SESSIONS.get(morsel.value)
         if username and username in data.USERS:
-            return {"name": username, "role": data.USERS[username]["role"]}
+            account = data.USERS[username]
+            return {
+                "name": username,
+                "role": account["role"],
+                "professor": account.get("professor", ""),
+            }
         return None
 
     def log_message(self, fmt, *args):  # quieter console
@@ -185,22 +190,65 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/return":
             item = data.find_item(form.get("id", ""))
             if item:
-                item["status"] = "available"
-                item["assigned_to"] = ""
-                item["assigned_on"] = ""
-                item["due_date"] = ""
+                is_admin = user["role"] == "admin"
+                code_ok = is_admin or form.get("code", "") == "1234"
+                if code_ok:
+                    item["status"] = "available"
+                    item["assigned_to"] = ""
+                    item["assigned_on"] = ""
+                    item["due_date"] = ""
+                    code = data.generate_return_code()
+                    self._send_html(200, views.render_return_result(item, code, user))
+                    return
+                self._send_html(200, views.render_index(
+                    user, return_error="Code not matched", return_error_id=item["id"]))
+                return
             self._redirect("/")
 
         elif url.path == "/professors/add":
+            id_card = form.get("id_card", "").strip()
             name = form.get("name", "").strip()
+            department = form.get("department", "").strip()
+
+            error = None
+            if not id_card:
+                error = "ID Card is required."
+            elif not data.valid_id_card(id_card):
+                error = "ID Card may only contain letters, numbers, dashes, and underscores."
+            elif data.find_professor_by_id_card(id_card):
+                error = f"ID Card '{id_card}' is already in use."
+
+            if error:
+                values = {"id_card": id_card, "name": name, "department": department}
+                self._send_html(200, views.render_professors_page(
+                    user, add_error=error, add_values=values))
+                return
+
             if name:
-                data.add_professor(name, form.get("department", "").strip())
+                data.add_professor(name, department, id_card)
             self._redirect("/professors")
 
         elif url.path == "/professors/edit":
             prof = data.find_professor(int(form.get("id", 0) or 0))
             if prof:
+                id_card = form.get("id_card", "").strip()
                 name = form.get("name", "").strip()
+
+                error = None
+                if not id_card:
+                    error = "ID Card is required."
+                elif not data.valid_id_card(id_card):
+                    error = "ID Card may only contain letters, numbers, dashes, and underscores."
+                else:
+                    existing = data.find_professor_by_id_card(id_card)
+                    if existing and existing["id"] != prof["id"]:
+                        error = f"ID Card '{id_card}' is already in use."
+
+                if error:
+                    self._send_html(200, views.render_professors_page(user, professors_error=error))
+                    return
+
+                prof["id_card"] = id_card
                 if name:
                     prof["name"] = name
                 prof["department"] = form.get("department", "").strip()
