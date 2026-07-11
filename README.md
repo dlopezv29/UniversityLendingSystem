@@ -219,6 +219,54 @@ Every function returns an HTML string; state is read live from the `data` module
 - **Category**: an edit/add only applies a category if it is in `data.CATEGORIES`.
 - **Professor removal**: blocked while the professor has active assigned items.
 
+## Metrics & observability (if this went live)
+
+The app is a demo (in-memory, single-node, `http.server`). None of the metrics
+below are collected today — this is what you'd want to instrument **before/when
+going to production**, grouped by category.
+
+### Performance / latency
+- **Response time** — per-route latency (p50 / p95 / p99), measured around
+  `do_GET` / `do_POST` in `handler.py`. Watch `/` (renders the full items table)
+  and `/professors` (renders a card grid) since render cost grows with item and
+  professor counts.
+- **Execution time of hot paths** — time spent in list scans (`find_item`,
+  `find_professor`, the `/request` "active items" scan) — these are O(n) over
+  `data.ITEMS` / `data.PROFESSORS` and would be the first thing to slow down at
+  scale.
+- **Throughput** — requests/sec and concurrent sessions the
+  `ThreadingHTTPServer` sustains before latency degrades.
+
+### Reliability / errors
+- **Error count & rate** — HTTP 5xx (unhandled exceptions in a handler) and 4xx
+  (404s from `render_404`, redirects from failed auth). Track as a rate
+  (errors / total requests), not just a raw number.
+- **Failed logins** — count of `/login` attempts that redirect to
+  `/login?error=1` (useful for both UX and abuse detection).
+- **Validation rejections** — how often `/add`, `/request`, `/professors/*`
+  bounce on the validation rules (duplicate ID, bad date, etc.).
+- **Uptime / availability** — server up %, plus mean time to recovery after a
+  restart (remember: a restart wipes all in-memory data).
+
+### Product / usage
+- **User satisfaction** — e.g. a CSAT/NPS prompt after a return, or a simple
+  thumbs-up/down on the receipt page (`render_return_result`).
+- **Loan activity** — requests created, returns completed, average loan
+  duration, and **overdue rate** (share of assigned items past `due_date` via
+  `is_overdue`).
+- **Utilization** — % of items `available` vs `assigned` vs `disabled`, and how
+  many professors are at/over the 3-item soft limit.
+- **Active users / sessions** — daily active users and live session count
+  (`len(data.SESSIONS)`).
+
+### How you'd collect them (not built yet)
+- Wrap `do_GET` / `do_POST` in a timing + status-code decorator to emit latency
+  and error metrics.
+- Export to something like Prometheus/Grafana (metrics), plus structured request
+  logs (currently `log_message` is silenced) for error/usage analysis.
+- Persist loan events to a store (needed anyway to survive restarts) so
+  product metrics like overdue rate and loan duration are queryable over time.
+
 ## Quirks / important notes
 
 - **Data is not persisted.** All state lives in memory; stopping or restarting
