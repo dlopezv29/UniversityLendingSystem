@@ -283,3 +283,161 @@ going to production**, grouped by category.
   Renaming or removing that professor in the UI does not update the login
   binding.
 - **Google Fonts is loaded over the network** for the Inter typeface.
+
+---
+
+# Production blueprint (if deployed for real)
+
+Everything above describes the **current demo**. This section is a parallel
+version of the same document for a **real, deployed** app — same headings, but
+describing how each piece would change once it runs on a server with a real
+database, real QR codes, live updates, and hardening. It's a target design, not
+what's built today.
+
+## Tech (production)
+
+- **Web framework instead of raw `http.server`** — e.g. FastAPI or Flask behind
+  a real WSGI/ASGI server (Gunicorn/Uvicorn), fronted by Nginx as a reverse
+  proxy with TLS. `ThreadingHTTPServer` is replaced.
+- **Real database** — PostgreSQL (or MySQL) for items, professors, loans, and
+  users, accessed via an ORM (SQLAlchemy) or query layer, with schema migrations
+  (Alembic). Replaces `data.ITEMS` / `data.PROFESSORS` / `data.NEXT_PROF_ID`.
+- **Session/cache store** — Redis for sessions (replacing the in-memory
+  `data.SESSIONS` dict) and for caching hot reads.
+- **Real QR generation** — a proper QR library (e.g. `qrcode` / `segno`)
+  producing scannable codes, replacing the decorative `_qr_placeholder_svg`. The
+  QR encodes a real return/pickup URL or token, not a cosmetic pattern.
+- **Live updates** — WebSockets or Server-Sent Events so the items table and
+  professor cards update in real time across clients (no manual refresh);
+  optionally a small frontend (React/HTMX) instead of full-page re-renders.
+- **Self-hosted assets** — bundle the Inter font locally (no Google Fonts
+  network dependency).
+- **Containerized + orchestrated** — Docker images deployed to a cloud
+  (Kubernetes / ECS / a PaaS), not `python3 app.py` on localhost.
+
+## Run / Deploy (production)
+
+- **Not localhost.** Runs on a public host behind a domain + HTTPS, e.g.
+  `https://lending.ulatina.ac.cr`.
+- Container build → CI pipeline → deploy. Config via environment variables
+  (DB URL, secret keys, Redis URL) — nothing hardcoded.
+- **Live updates / zero-downtime deploys** — rolling or blue-green deploys so
+  new versions ship without dropping sessions (sessions live in Redis, so a
+  restart no longer wipes login state).
+- Managed database with automated backups + point-in-time recovery.
+
+## Accounts (production)
+
+- Users stored in the database, **passwords hashed** (bcrypt/argon2) — never
+  plaintext.
+- Real onboarding: an admin invites/creates users; professors get their own
+  login instead of a hardcoded `DGarcia` account bound to a fixed name.
+- Integration with the university's **SSO / LDAP / OAuth** so staff use existing
+  credentials. Password reset, email verification, account lockout.
+
+## Roles & permissions (production)
+
+- Same core roles (`admin`, `professor`) but backed by a real
+  **authorization layer** (role-based access control), possibly more roles
+  (e.g. `department-admin`, `auditor`).
+- Server-side enforcement on every route (as today) **plus** audit logging of
+  who did what and when.
+- The professor↔account binding comes from the DB relationship, so renaming a
+  professor updates everywhere (fixes the current `DGarcia` quirk).
+
+## Features (production)
+
+Everything the demo does, plus:
+
+- **Real return codes / QR** — scannable QR on the receipt; scanning it (or
+  entering the code) verifies against the DB, so codes aren't hardcoded.
+- **Notifications** — email/SMS reminders before a due date and when an item is
+  overdue.
+- **Live dashboard** — real-time item availability and overdue counts via
+  WebSockets/SSE.
+- **Search & pagination** — server-side across large catalogs (the current
+  client-side filtering doesn't scale).
+- **Audit trail & history** — full loan history per item and per professor.
+- **File uploads** — item photos, condition reports.
+- **Configurable limits** — the 3-item soft limit becomes an admin setting, not
+  a constant in code.
+- **Reporting / export** — CSV/PDF exports for inventory and overdue reports.
+
+## Routes reference (production)
+
+- Same logical routes, but exposed as a **versioned REST/JSON API**
+  (`/api/v1/items`, `/api/v1/professors`, `/api/v1/loans`, `/api/v1/auth/...`)
+  consumed by a frontend, **plus** a WebSocket/SSE endpoint for live updates.
+- Proper HTTP semantics (POST/PUT/PATCH/DELETE, not POST-only), rate limiting,
+  CSRF protection, and input validation at the API boundary.
+
+## Data model (production)
+
+- Normalized relational tables: `users`, `items`, `professors`, `loans`
+  (a loan row per assignment, so history is preserved instead of overwriting the
+  item's `assigned_to` / `due_date` fields), `categories` as its own table.
+- Foreign keys, indexes on lookup columns (item id, id_card), timestamps
+  (`created_at` / `updated_at`), soft-delete flags.
+- Sessions/tokens in Redis with expiry, not a plain dict.
+
+## Module & function reference (production)
+
+- The current split (`data` / `handler` / `views`) becomes layered:
+  **models** (ORM), **repository/service** layer (business rules like the 3-item
+  limit and validation), **API/controllers** (routing), and **templates or a
+  separate frontend** for rendering.
+- Helpers like `find_item` / `find_professor` become indexed DB queries;
+  `is_overdue` becomes a DB-computed field or query filter; `generate_return_code`
+  ties to a persisted, verifiable token; `_qr_placeholder_svg` is replaced by a
+  real QR encoder.
+
+## Validation rules (production)
+
+- Same rules, enforced at the API layer **and** the database (unique
+  constraints, check constraints, NOT NULL) so bad data can't slip in from
+  another client.
+- Stronger input validation/sanitization, size limits, and rate limiting to
+  resist abuse.
+
+## Metrics & observability (production)
+
+Now actually collected, not hypothetical. Same categories as above, wired to
+real tooling:
+
+### Performance / latency (production)
+- Response time p50/p95/p99 **per API endpoint**, exported to Prometheus and
+  graphed in Grafana; alerts on p95 regressions.
+- Database query timing (slow-query log), cache hit rate (Redis), and
+  end-to-end request tracing (OpenTelemetry).
+
+### Reliability / errors (production)
+- Error rate (5xx/4xx) with alerting; exceptions captured in Sentry (or similar)
+  with stack traces.
+- Uptime/availability SLOs, health-check endpoints, and on-call alerting.
+- Failed-login and abuse metrics feeding security monitoring.
+
+### Product / usage (production)
+- **User satisfaction** collected for real (in-app CSAT/NPS, support tickets).
+- Loan throughput, average loan duration, **overdue rate**, item utilization,
+  DAU/MAU — all queryable from the `loans` table over time.
+- Funnel/adoption analytics (e.g. how often requests are created vs abandoned).
+
+### How they're collected (production)
+- Metrics middleware on every request → Prometheus/Grafana.
+- Structured JSON logs (the demo's silenced `log_message` becomes real request
+  logging) shipped to a log aggregator (ELK/Loki).
+- Errors → Sentry; traces → OpenTelemetry; product events → an analytics
+  pipeline/warehouse.
+
+## Quirks / important notes (production)
+
+The demo's quirks are **resolved** in this version:
+
+- Data **is** persisted (real DB + backups) — restarts no longer wipe state.
+- Auth is real — hashed passwords, SSO, session expiry.
+- Return codes/QR are **real and verifiable**, not hardcoded `1234` or a
+  decorative SVG.
+- The professor↔account binding lives in the DB, so renames propagate.
+- Fonts and other assets are self-hosted (no third-party network dependency).
+- New production concerns to watch instead: DB migrations, secret management,
+  scaling/load, GDPR/data-retention, and dependency/security patching.
