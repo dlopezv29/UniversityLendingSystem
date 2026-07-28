@@ -6,13 +6,23 @@ Reads state from and mutates the ``data`` module; renders responses with the
 
 from __future__ import annotations
 
+import time
 from datetime import date
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 import data
+import metrics
 import views
+
+# Paths that get their own metric label. Anything else is folded into "other",
+# so a flood of 404s cannot grow the metrics table without bound.
+KNOWN_PATHS = {
+    "/", "/login", "/logout", "/professors", "/metrics", "/metrics/reset",
+    "/add", "/edit", "/remove", "/toggle-disable", "/return", "/request",
+    "/professors/add", "/professors/edit", "/professors/remove",
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,20 +59,42 @@ class Handler(BaseHTTPRequestHandler):
         if not morsel:
             return None
         username = data.SESSIONS.get(morsel.value)
-        if username and username in data.USERS:
-            account = data.USERS[username]
+        account = data.find_user(username) if username else None
+        if account:
             return {
-                "name": username,
+                "name": account["name"],
                 "role": account["role"],
-                "professor": account.get("professor", ""),
+                "professor": account["professor"],
             }
         return None
 
     def log_message(self, fmt, *args):  # quieter console
         return
 
+    def _metric_label(self, verb: str) -> str:
+        path = urlparse(self.path).path
+        return f"{verb} {path if path in KNOWN_PATHS else 'other'}"
+
     # --- routes ---------------------------------------------------------
     def do_GET(self):
+        """Time the whole request, then route it."""
+        start = time.perf_counter()
+        try:
+            self._route_get()
+        finally:
+            metrics.record("request", self._metric_label("GET"),
+                           time.perf_counter() - start)
+
+    def do_POST(self):
+        """Time the whole request, then route it."""
+        start = time.perf_counter()
+        try:
+            self._route_post()
+        finally:
+            metrics.record("request", self._metric_label("POST"),
+                           time.perf_counter() - start)
+
+    def _route_get(self):
         url = urlparse(self.path)
         user = self.current_user()
 
@@ -90,10 +122,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/")
                 return
             self._send_html(200, views.render_professors_page(user))
+        elif url.path == "/metrics":
+            if user["role"] != "admin":
+                self._redirect("/")
+                return
+            self._send_html(200, views.render_metrics_page(user, metrics.snapshot()))
         else:
             self._send_html(404, views.render_404())
 
-    def do_POST(self):
+    def _route_post(self):
         url = urlparse(self.path)
         form = self._read_form()
         user = self.current_user()
@@ -101,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/login":
             username = form.get("username", "").strip()
             password = form.get("password", "")
-            account = data.USERS.get(username)
+            account = data.find_user(username)
             if account and account["password"] == password:
                 token = data.new_token()
                 data.SESSIONS[token] = username
@@ -130,9 +167,15 @@ class Handler(BaseHTTPRequestHandler):
         admin_routes = (
             "/add", "/edit", "/remove", "/toggle-disable", "/request",
             "/professors/add", "/professors/edit", "/professors/remove",
+            "/metrics/reset",
         )
         if url.path in admin_routes and user["role"] != "admin":
             self._redirect("/")
+            return
+
+        if url.path == "/metrics/reset":
+            metrics.reset()
+            self._redirect("/metrics")
             return
 
         if url.path == "/add":
@@ -149,6 +192,12 @@ class Handler(BaseHTTPRequestHandler):
             elif data.find_item(item_id):
                 error = f"ID '{item_id}' is already in use."
 
+            if not error and name and category in data.CATEGORIES:
+                # The database has the final say on uniqueness, so a second
+                # request that slipped past the check above still loses here.
+                if data.add_item(item_id, name, category, description) is None:
+                    error = f"ID '{item_id}' is already in use."
+
             if error:
                 values = {
                     "id": item_id,
@@ -159,32 +208,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(200, views.render_index(user, add_error=error, add_values=values))
                 return
 
-            if name and category in data.CATEGORIES:
-                data.add_item(item_id, name, category, description)
             self._redirect("/")
 
         elif url.path == "/edit":
-            item = data.find_item(form.get("id", ""))
-            if item:
-                name = form.get("name", "").strip()
-                category = form.get("category", "").strip()
-                if name:
-                    item["name"] = name
-                if category in data.CATEGORIES:
-                    item["category"] = category
-                item["description"] = form.get("description", "").strip()
+            item_id = form.get("id", "")
+            if data.find_item(item_id):
+                data.update_item(
+                    item_id,
+                    form.get("name", "").strip(),
+                    form.get("category", "").strip(),
+                    form.get("description", "").strip(),
+                )
             self._redirect("/")
 
         elif url.path == "/remove":
-            item = data.find_item(form.get("id", ""))
-            if item:
-                data.ITEMS.remove(item)
+            data.delete_item(form.get("id", ""))
             self._redirect("/")
 
         elif url.path == "/toggle-disable":
             item = data.find_item(form.get("id", ""))
             if item and item["status"] in ("available", "disabled"):
-                item["status"] = "disabled" if item["status"] == "available" else "available"
+                new_status = "disabled" if item["status"] == "available" else "available"
+                data.set_item_status(item["id"], new_status)
             self._redirect("/")
 
         elif url.path == "/return":
@@ -193,10 +238,8 @@ class Handler(BaseHTTPRequestHandler):
                 is_admin = user["role"] == "admin"
                 code_ok = is_admin or form.get("code", "") == "1234"
                 if code_ok:
-                    item["status"] = "available"
-                    item["assigned_to"] = ""
-                    item["assigned_on"] = ""
-                    item["due_date"] = ""
+                    data.return_item(item["id"])
+                    item = data.find_item(item["id"])
                     code = data.generate_return_code()
                     self._send_html(200, views.render_return_result(item, code, user))
                     return
@@ -218,14 +261,16 @@ class Handler(BaseHTTPRequestHandler):
             elif data.find_professor_by_id_card(id_card):
                 error = f"ID Card '{id_card}' is already in use."
 
+            if not error and name:
+                if data.add_professor(name, department, id_card) is None:
+                    error = f"ID Card '{id_card}' is already in use."
+
             if error:
                 values = {"id_card": id_card, "name": name, "department": department}
                 self._send_html(200, views.render_professors_page(
                     user, add_error=error, add_values=values))
                 return
 
-            if name:
-                data.add_professor(name, department, id_card)
             self._redirect("/professors")
 
         elif url.path == "/professors/edit":
@@ -244,30 +289,29 @@ class Handler(BaseHTTPRequestHandler):
                     if existing and existing["id"] != prof["id"]:
                         error = f"ID Card '{id_card}' is already in use."
 
+                if not error:
+                    ok = data.update_professor(
+                        prof["id"], id_card, name, form.get("department", "").strip()
+                    )
+                    if not ok:
+                        error = f"ID Card '{id_card}' is already in use."
+
                 if error:
                     self._send_html(200, views.render_professors_page(user, professors_error=error))
                     return
-
-                prof["id_card"] = id_card
-                if name:
-                    prof["name"] = name
-                prof["department"] = form.get("department", "").strip()
             self._redirect("/professors")
 
         elif url.path == "/professors/remove":
             prof = data.find_professor(int(form.get("id", 0) or 0))
             if prof:
-                has_active = any(
-                    i["assigned_to"] == prof["name"] and i["status"] == "assigned"
-                    for i in data.ITEMS
-                )
+                has_active = data.professor_active_item_count(prof["id"]) > 0
                 if has_active:
                     self._send_html(200, views.render_professors_page(
                         user,
                         professors_error="Cannot remove: this professor has active assigned items.",
                     ))
                     return
-                data.PROFESSORS.remove(prof)
+                data.delete_professor(prof["id"])
             self._redirect("/professors")
 
         elif url.path == "/request":
@@ -283,16 +327,13 @@ class Handler(BaseHTTPRequestHandler):
 
             item = None
             if not error:
-                item = next(
-                    (i for i in data.ITEMS if i["name"] == item_name and i["status"] == "available"),
-                    None,
-                )
+                item = data.find_available_item_by_name(item_name)
                 if not item:
                     error = "Select an available item from the list."
 
             professor = None
             if not error:
-                professor = next((p for p in data.PROFESSORS if p["name"] == professor_name), None)
+                professor = data.find_professor_by_name(professor_name)
                 if not professor:
                     error = "Select an existing professor from the list, or add them first."
 
@@ -305,10 +346,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(200, views.render_index(user, request_error=error, request_values=values))
                 return
 
-            current_items = [
-                i for i in data.ITEMS
-                if i["assigned_to"] == professor["name"] and i["status"] == "assigned"
-            ]
+            current_items = data.items_assigned_to(professor["id"])
             if len(current_items) >= 3 and not confirmed:
                 self._send_html(
                     200,
@@ -316,10 +354,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            item["status"] = "assigned"
-            item["assigned_to"] = professor["name"]
-            item["assigned_on"] = today_iso
-            item["due_date"] = due_date
+            data.assign_item(item["id"], professor["id"], today_iso, due_date)
             self._redirect("/")
 
         else:

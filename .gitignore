@@ -1,0 +1,5 @@
+# Generated database — holds account passwords in plaintext, never commit it.
+lending.db
+
+__pycache__/
+*.pyc

@@ -1,8 +1,8 @@
 """HTML rendering — the full server-rendered frontend.
 
 Every function returns an HTML string. State is read live from the ``data``
-module (qualified access, never `from data import ...`, so mutations are
-always visible).
+module, which queries the database and hands back plain dicts. This module only
+reads — it never writes.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ def render_layout(
     if user and user["role"] == "admin":
         items_cls = "active" if active_nav == "items" else ""
         profs_cls = "active profs" if active_nav == "professors" else ""
+        metrics_cls = "active" if active_nav == "metrics" else ""
         nav = f"""
   <nav class="mainnav" aria-label="Sections">
     <a class="{items_cls}" href="/"{' aria-current="page"' if active_nav == 'items' else ''}>
@@ -59,6 +60,12 @@ def render_layout(
         <circle cx="9" cy="7" r="4"></circle>
         <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"></path>
       </svg>Professors Management</a>
+    <a class="{metrics_cls}" href="/metrics"{' aria-current="page"' if active_nav == 'metrics' else ''}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 3v18h18"></path>
+        <path d="M7 15l4-5 3 3 5-7"></path>
+      </svg>Performance</a>
   </nav>"""
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -231,6 +238,25 @@ def render_layout(
             background:var(--bg); border:1px dashed var(--line); border-radius:10px;
             padding:12px 16px; margin:0 0 10px; }}
   .receipt .actions {{ justify-content:center; }}
+  /* Performance page */
+  .kpis {{ display:grid; gap:12px; margin-bottom:20px;
+           grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }}
+  .kpi {{ background:var(--surface); border:1px solid var(--line);
+          border-radius:12px; padding:14px 16px; }}
+  .kpi b {{ display:block; font-size:22px; font-weight:700;
+            font-variant-numeric:tabular-nums; letter-spacing:-.02em; }}
+  .kpi span {{ display:block; font-size:11px; text-transform:uppercase;
+               letter-spacing:.05em; color:var(--muted); margin-top:2px; }}
+  .kpi small {{ display:block; color:var(--muted); font-size:12px; margin-top:6px; }}
+  .num {{ text-align:right; font-variant-numeric:tabular-nums;
+          font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }}
+  th.num {{ font-family:inherit; }}
+  .metric-name {{ font-weight:500; }}
+  .metric-name code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                       font-size:12px; }}
+  .row-lock td {{ background:var(--warn-soft); }}
+  .table-scroll {{ overflow-x:auto; }}
+  .hint {{ color:var(--muted); font-size:12px; margin:0 0 14px; }}
 </style>
 </head>
 <body>
@@ -270,7 +296,10 @@ def render_index(
     is_admin = user["role"] == "admin"
     professor_name = user.get("professor", "")
 
-    visible_items = data.ITEMS
+    # Fetched once and reused below, rather than re-querying per section.
+    items = data.all_items()
+
+    visible_items = items
     if category_filter:
         visible_items = [i for i in visible_items if i["category"] == category_filter]
     if overdue_only:
@@ -399,12 +428,13 @@ def render_index(
   </div>
 </div>
 """
-        available_items = [i for i in data.ITEMS if i["status"] == "available"]
+        available_items = [i for i in items if i["status"] == "available"]
         item_options = "".join(
             f'<option value="{html.escape(i["name"], quote=True)}">' for i in available_items
         )
         professor_options = "".join(
-            f'<option value="{html.escape(p["name"], quote=True)}">' for p in data.PROFESSORS
+            f'<option value="{html.escape(p["name"], quote=True)}">'
+            for p in data.all_professors()
         )
         today_iso = date.today().isoformat()
         rv = request_values or {}
@@ -581,8 +611,12 @@ def render_professors_page(
     """Professors Management page — a card-grid view, visually distinct from the
     items table. Admin-only; each card shows the professor plus their active
     item count, with edit/remove controls."""
-    total = len(data.PROFESSORS)
-    assigned_total = sum(1 for i in data.ITEMS if i["status"] == "assigned")
+    # Fetched once and reused below, rather than re-querying per card.
+    professors = data.all_professors()
+    items = data.all_items()
+
+    total = len(professors)
+    assigned_total = sum(1 for i in items if i["status"] == "assigned")
 
     av = add_values or {}
     add_idcard_val = html.escape(av.get("id_card", ""), quote=True)
@@ -592,9 +626,9 @@ def render_professors_page(
     add_open_cls = " open" if add_error else ""
 
     cards = ""
-    for p in data.PROFESSORS:
+    for p in professors:
         active = [
-            i for i in data.ITEMS if i["assigned_to"] == p["name"] and i["status"] == "assigned"
+            i for i in items if i["assigned_to"] == p["name"] and i["status"] == "assigned"
         ]
         count = len(active)
         dept = html.escape(p["department"]) if p["department"] else '<span class="muted">No department</span>'
@@ -654,7 +688,7 @@ def render_professors_page(
       </div>
     </div>"""
 
-    grid = f'<div class="prof-grid">{cards}</div>' if data.PROFESSORS else (
+    grid = f'<div class="prof-grid">{cards}</div>' if professors else (
         '<div class="card empty">No professors yet. Add the first one below.</div>'
     )
 
@@ -733,6 +767,142 @@ def render_professors_page(
 </script>
 """
     return render_layout("Professors Management", body, user, active_nav="professors")
+
+
+def _ms(value: float) -> str:
+    """Milliseconds with a sensible number of digits for the magnitude."""
+    if value >= 100:
+        return f"{value:.0f}"
+    if value >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
+def _metric_table(rows: list, label: str) -> str:
+    """One sortable-looking stats table; `rows` come from metrics.snapshot()."""
+    if not rows:
+        return f'<p class="muted">No {label} recorded yet.</p>'
+
+    body_rows = ""
+    for row in rows:
+        highlight = ' class="row-lock"' if row["name"] == "_lock wait" else ""
+        body_rows += f"""
+        <tr{highlight}>
+          <td class="metric-name"><code>{html.escape(row['name'])}</code></td>
+          <td class="num">{row['count']}</td>
+          <td class="num">{_ms(row['mean_ms'])}</td>
+          <td class="num">{_ms(row['p50_ms'])}</td>
+          <td class="num">{_ms(row['p95_ms'])}</td>
+          <td class="num">{_ms(row['p99_ms'])}</td>
+          <td class="num">{_ms(row['max_ms'])}</td>
+          <td class="num">{_ms(row['total_ms'])}</td>
+        </tr>"""
+
+    return f"""
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>{html.escape(label)}</th>
+            <th class="num">Calls</th>
+            <th class="num">Mean ms</th>
+            <th class="num">p50 ms</th>
+            <th class="num">p95 ms</th>
+            <th class="num">p99 ms</th>
+            <th class="num">Max ms</th>
+            <th class="num">Total ms</th>
+          </tr>
+        </thead>
+        <tbody>{body_rows}</tbody>
+      </table>
+    </div>"""
+
+
+def render_metrics_page(user: dict, snap: dict) -> str:
+    """Performance page: timings collected since the server started (or since
+    the last reset). Admin-only."""
+    requests = snap["groups"]["request"]
+    functions = snap["groups"]["function"]
+    queries = snap["groups"]["query"]
+
+    def find(rows: list, name: str) -> dict:
+        for row in rows:
+            if row["name"] == name:
+                return row
+        return {"count": 0, "mean_ms": 0.0, "p95_ms": 0.0}
+
+    login = find(requests, "POST /login")
+    find_user = find(functions, "find_user")
+    lock_wait = find(queries, "_lock wait")
+
+    total_requests = sum(row["count"] for row in requests)
+    total_queries = sum(row["count"] for row in queries if row["name"] != "_lock wait")
+    conn = snap["connection"]
+    uptime = snap["uptime_seconds"]
+    uptime_text = (f"{uptime / 3600:.1f} h" if uptime >= 3600
+                   else f"{uptime / 60:.1f} min" if uptime >= 60
+                   else f"{uptime:.0f} s")
+
+    body = f"""
+<div class="page-head">
+  <div>
+    <div class="accent-rule"></div>
+    <h2>Performance</h2>
+    <p class="lead">{total_requests} request{'' if total_requests == 1 else 's'} ·
+       {total_queries} quer{'y' if total_queries == 1 else 'ies'} · measured over {uptime_text}</p>
+  </div>
+  <form class="inline" action="/metrics/reset" method="post"
+        onsubmit="return confirm('Clear all collected metrics?');">
+    <button class="btn-ghost btn-sm" type="submit">Reset</button>
+  </form>
+</div>
+
+<div class="kpis">
+  <div class="kpi">
+    <b>{_ms(conn['last_ms'])} ms</b><span>DB connection open</span>
+    <small>{conn['count']} open{'' if conn['count'] == 1 else 's'} since start</small>
+  </div>
+  <div class="kpi">
+    <b>{_ms(login['mean_ms'])} ms</b><span>Login request (mean)</span>
+    <small>p95 {_ms(login['p95_ms'])} ms · {login['count']} login{'' if login['count'] == 1 else 's'}</small>
+  </div>
+  <div class="kpi">
+    <b>{_ms(find_user['mean_ms'])} ms</b><span>find_user (mean)</span>
+    <small>the login lookup — also runs on every authenticated request</small>
+  </div>
+  <div class="kpi">
+    <b>{_ms(lock_wait['mean_ms'])} ms</b><span>Lock wait (mean)</span>
+    <small>p95 {_ms(lock_wait['p95_ms'])} ms</small>
+  </div>
+  <div class="kpi">
+    <b>{snap['lock']['peak_waiting']}</b><span>Peak concurrent</span>
+    <small>threads queued for the DB lock</small>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>HTTP requests</h2></div>
+  <p class="hint">End-to-end time inside <code>do_GET</code> / <code>do_POST</code>:
+     database work plus HTML rendering.</p>
+  {_metric_table(requests, "Route")}
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Data functions</h2></div>
+  <p class="hint">Time inside each <code>data.py</code> call, including the SQL it runs.</p>
+  {_metric_table(functions, "Function")}
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>SQL statements</h2></div>
+  <p class="hint">Time executing each statement, plus <code>_lock wait</code> (highlighted):
+     how long threads queued for <code>db._lock</code> before their statement could run.
+     All statements share one connection, so this is the contention cost — it stays near
+     zero until requests overlap.</p>
+  {_metric_table(queries, "Statement")}
+</div>
+"""
+    return render_layout("Performance", body, user, active_nav="metrics")
 
 
 def render_confirm_request(
